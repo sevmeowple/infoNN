@@ -1,7 +1,10 @@
 from pydantic import BaseModel, Field
-
+from livelossplot import PlotLosses
 import torch
-from torch import nn
+from torch import device, nn
+import platform
+import psutil
+import time
 
 from typing import List, Optional, Tuple, Union, TYPE_CHECKING
 import collections
@@ -104,18 +107,34 @@ class ModelConfig(BaseModel):
 
     lr: float = 0.01
     num_hiddens: int = 256
+    output_size: int = 10
     # 还可以包含其他配置，如 dropout_prob, weight_decay等
-
-
+    self_device: Optional[str] = None  # 新增：指定设备，如 "cuda:1"
+    
+    # 静态方法展示所有可用gpu设备及其选择id
+    @staticmethod
+    def available_devices() -> List[str]:
+        """Returns a list of available devices."""
+        if torch.cuda.is_available():
+            return [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        else:
+            return ["cpu"]
 class ModernModule(nn.Module):
-    """A clean, decoupled base class for models."""
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.self_device = self._resolve_device()
+        self.to(self.self_device)
 
-        # 在子类中，你需要定义 self.net
-        # 例如: self.net = nn.Sequential(...)
+    def _resolve_device(self) -> torch.device:
+        if self.config.self_device:
+            return torch.device(self.config.self_device)
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    def set_device(self, device_str: str):
+        self.config.self_device = device_str
+        self.self_device = torch.device(device_str)
+        self.to(self.self_device)
 
     def forward(self, X):
         """Default forward pass."""
@@ -160,7 +179,7 @@ class ModernModule(nn.Module):
         # 这是一个常见的实现，可以放在基类中
         return torch.optim.SGD(self.parameters(), lr=self.config.lr)
 
-
+    
 # 引入我们之前实现的 Pydantic 版 ProgressBoard
 # from your_file import ProgressBoard, BoardConfig
 
@@ -220,6 +239,214 @@ class PlottingCallback(Callback):
         # x轴是当前epoch数 (e.g., 1, 2, 3...)
         x = trainer.epoch + 1
         self.board.draw(x, val_metrics["loss"], "val_loss", every_n=1)
+
+class LiveLossCallback(Callback):
+    """使用 livelossplot 的回调"""
+    
+    def __init__(self):
+        super().__init__()
+        self.liveloss = PlotLosses()
+    
+    def on_epoch_end(self, trainer, train_metrics: dict, val_metrics: dict):
+        """在每个 epoch 结束时更新图表"""
+        logs = {}
+        
+        # 添加训练指标
+        if train_metrics:
+            logs['loss'] = train_metrics['loss']
+            if 'accuracy' in train_metrics:
+                logs['accuracy'] = train_metrics['accuracy']
+        
+        # 添加验证指标（自动加 val_ 前缀）
+        if val_metrics:
+            logs['val_loss'] = val_metrics['loss']
+            if 'accuracy' in val_metrics:
+                logs['val_accuracy'] = val_metrics['accuracy']
+        
+        # 更新并显示图表
+        self.liveloss.update(logs)
+        self.liveloss.send()
+
+
+
+class SystemInfoCallback(Callback):
+    """显示系统和硬件信息的回调"""
+    
+    def __init__(self, show_detailed=False):
+        super().__init__()
+        self.show_detailed = show_detailed
+    
+    def on_train_begin(self, trainer: "Trainer"):
+        print("🖥️  系统信息:")
+        print(f"   操作系统: {platform.system()} {platform.release()}")
+        print(f"   Python 版本: {platform.python_version()}")
+        print(f"   PyTorch 版本: {torch.__version__}")
+        
+        # 显示模型当前使用的设备
+        if hasattr(trainer.model, 'device'):
+            print(f"🎯 模型设备: {trainer.model.device}")
+        
+        # GPU 信息
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            current_device = torch.cuda.current_device()
+            device_name = torch.cuda.get_device_name(current_device)
+            memory_allocated = torch.cuda.memory_allocated(current_device) / 1024**3
+            memory_reserved = torch.cuda.memory_reserved(current_device) / 1024**3
+            
+            print(f"🚀 GPU 信息:")
+            print(f"   设备数量: {device_count}")
+            print(f"   当前设备: {current_device} ({device_name})")
+            print(f"   已分配内存: {memory_allocated:.2f} GB")
+            print(f"   已保留内存: {memory_reserved:.2f} GB")
+            
+            if self.show_detailed:
+                for i in range(device_count):
+                    print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
+        else:
+            print("⚠️  未检测到可用的 GPU，使用 CPU")
+
+        # CPU 信息
+        cpu_count = psutil.cpu_count(logical=False)
+        cpu_count_logical = psutil.cpu_count(logical=True)
+        memory = psutil.virtual_memory()
+        
+        print(f"💻 CPU 信息:")
+        print(f"   物理核心数: {cpu_count}")
+        print(f"   逻辑核心数: {cpu_count_logical}")
+        print(f"   总内存: {memory.total / 1024**3:.1f} GB")
+        print(f"   可用内存: {memory.available / 1024**3:.1f} GB")
+        
+        if self.show_detailed:
+            print(f"   CPU 使用率: {psutil.cpu_percent(interval=1):.1f}%")
+            print(f"   内存使用率: {memory.percent:.1f}%")
+        
+        print()  # 空行分隔
+
+
+class TrainingProgressCallback(Callback):
+    """显示训练进度信息的回调"""
+    
+    def __init__(self, show_time_estimate=True):
+        super().__init__()
+        self.show_time_estimate = show_time_estimate
+        self.start_time:float = 0.0
+        self.epoch_start_time:float = 0.0  
+    
+    def on_train_begin(self, trainer: "Trainer"):
+        self.start_time = time.time()
+        
+        print("📊 训练配置:")
+        print(f"   总轮次: {trainer.max_epochs}")
+        print(f"   训练批次数: {trainer.num_train_batches}")
+        if trainer.val_loader:
+            print(f"   验证批次数: {trainer.num_val_batches}")
+        
+        # 显示模型信息 - 处理懒加载模块
+        try:
+            total_params = sum(p.numel() for p in trainer.model.parameters())
+            trainable_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+            print(f"   模型参数总数: {total_params:,}")
+            print(f"   可训练参数: {trainable_params:,}")
+        except ValueError as e:
+            if "uninitialized parameter" in str(e):
+                print("   模型参数: 使用懒加载模块，将在第一次前向传播后显示")
+            else:
+                raise e
+        
+        print(f"   优化器: {type(trainer.model.configure_optimizers()).__name__}")
+        print()
+    
+    def on_epoch_begin(self, trainer: "Trainer"):
+        self.epoch_start_time = time.time()
+        print(f"🔄 Epoch {trainer.epoch + 1}/{trainer.max_epochs}")
+    
+    def on_epoch_end(self, trainer: "Trainer", train_metrics: dict, val_metrics: dict):
+        import time
+        if self.epoch_start_time:
+            epoch_time = time.time() - self.epoch_start_time
+            print(f"   训练损失: {train_metrics['loss']:.4f}")
+            if val_metrics:
+                print(f"   验证损失: {val_metrics['loss']:.4f}")
+            print(f"   用时: {epoch_time:.2f}s")
+            
+            # 估算剩余时间
+            if self.show_time_estimate and trainer.epoch > 0:
+                elapsed_time = time.time() - self.start_time
+                avg_time_per_epoch = elapsed_time / (trainer.epoch + 1)
+                remaining_epochs = trainer.max_epochs - trainer.epoch - 1
+                eta = remaining_epochs * avg_time_per_epoch
+                
+                if eta > 60:
+                    print(f"   预计剩余时间: {eta/60:.1f} 分钟")
+                else:
+                    print(f"   预计剩余时间: {eta:.0f} 秒")
+            print()
+    
+    def on_train_end(self, trainer: "Trainer"):
+        import time
+        if self.start_time:
+            total_time = time.time() - self.start_time
+            print(f"✅ 训练完成！总用时: {total_time/60:.1f} 分钟")
+
+
+class ModelSummaryCallback(Callback):
+    """显示模型架构摘要的回调"""
+    
+    def on_train_begin(self, trainer: "Trainer"):
+        print("🏗️  模型架构:")
+        print(trainer.model)
+        print()
+
+
+class MemoryMonitorCallback(Callback):
+    """监控内存使用的回调"""
+    
+    def __init__(self, check_every_n_epochs=1):
+        super().__init__()
+        self.check_every_n_epochs = check_every_n_epochs
+    
+    def on_epoch_end(self, trainer: "Trainer", train_metrics: dict, val_metrics: dict):
+        if (trainer.epoch + 1) % self.check_every_n_epochs == 0:
+            if torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated() / 1024**3
+                memory_reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"   GPU 内存 - 已分配: {memory_allocated:.2f}GB, 已保留: {memory_reserved:.2f}GB")
+            
+            memory = psutil.virtual_memory()
+            print(f"   系统内存使用率: {memory.percent:.1f}%")
+
+
+# 创建一个便捷的组合回调
+class DefaultCallbacks:
+    """提供常用回调组合的工厂类"""
+    
+    @staticmethod
+    def basic():
+        """基础回调组合"""
+        return [
+            SystemInfoCallback(),
+            TrainingProgressCallback(),
+        ]
+    
+    @staticmethod
+    def detailed():
+        """详细回调组合"""
+        return [
+            SystemInfoCallback(show_detailed=True),
+            ModelSummaryCallback(),
+            TrainingProgressCallback(),
+            MemoryMonitorCallback(),
+        ]
+    
+    @staticmethod
+    def with_live_loss():
+        """包含实时损失图的回调组合"""
+        return [
+            SystemInfoCallback(),
+            TrainingProgressCallback(),
+            LiveLossCallback(),
+        ]
 
 
 class Trainer:
