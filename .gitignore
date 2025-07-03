@@ -14,3 +14,11 @@ wheels/
 data/**
 
 repos/**
+
+notebooks/learn/mi_analysis/**
+notebooks/learn/lightning_logs/**
+
+**.csv
+**/hparams.yaml
+**.ckpt
+**.log

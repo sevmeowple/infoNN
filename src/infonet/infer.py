@@ -100,6 +100,67 @@ def compute_smi_mean(sample_x, sample_y, model, proj_num, seq_len, batchsize):
 
     return np.mean(np.array(results))
 
+
+
+def compute_smi_mean_gpu(sample_x, sample_y, model, proj_num, seq_len, batchsize):
+    """
+    GPU版本的compute_smi_mean - 完全在GPU上计算
+    """
+    device = next(model.parameters()).device
+    
+    # 确保输入数据在GPU上
+    if isinstance(sample_x, np.ndarray):
+        sample_x = torch.from_numpy(sample_x).float().to(device)
+    elif isinstance(sample_x, torch.Tensor):
+        sample_x = sample_x.to(device).float()
+    
+    if isinstance(sample_y, np.ndarray):
+        sample_y = torch.from_numpy(sample_y).float().to(device)
+    elif isinstance(sample_y, torch.Tensor):
+        sample_y = sample_y.to(device).float()
+    
+    # 如果数据超过seq_len，截取前seq_len个样本
+    if sample_x.shape[0] > seq_len:
+        sample_x = sample_x[:seq_len]
+        sample_y = sample_y[:seq_len]
+    
+    dx = sample_x.shape[1] if sample_x.dim() > 1 else 1
+    dy = sample_y.shape[1] if sample_y.dim() > 1 else 1
+    
+    results = []
+    
+    with torch.no_grad():
+        # 批量处理投影
+        num_batches = proj_num // batchsize
+        for _ in range(num_batches):
+            # 在GPU上生成随机投影矩阵
+            if dx > 1:
+                theta = torch.randn(dx, batchsize, device=device)  # 修复：调整维度顺序
+                x_proj = torch.matmul(sample_x, theta)  # [seq_len, dx] @ [dx, batchsize] = [seq_len, batchsize]
+                x_proj = x_proj.T  # 转置为 [batchsize, seq_len]
+            else:
+                x_proj = sample_x.unsqueeze(0).repeat(batchsize, 1)
+            
+            if dy > 1:
+                phi = torch.randn(dy, batchsize, device=device)  # 修复：调整维度顺序
+                y_proj = torch.matmul(sample_y, phi)  # [seq_len, dy] @ [dy, batchsize] = [seq_len, batchsize]
+                y_proj = y_proj.T  # 转置为 [batchsize, seq_len]
+            else:
+                y_proj = sample_y.unsqueeze(0).repeat(batchsize, 1)
+            
+            # GPU上的排序归一化
+            x_ranked = torch.argsort(torch.argsort(x_proj, dim=1), dim=1).float() / x_proj.shape[1]
+            y_ranked = torch.argsort(torch.argsort(y_proj, dim=1), dim=1).float() / y_proj.shape[1]
+            
+            # 构建批次数据 [batchsize, seq_len, 2]
+            batch = torch.stack([x_ranked, y_ranked], dim=2)
+            
+            # 模型推理
+            mi_lb = model(batch)
+            results.append(mi_lb.mean().item())
+    
+    return np.mean(results)
+
 def example_d_1():
     seq_len = 4781
     results = []
