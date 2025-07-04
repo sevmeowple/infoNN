@@ -23,7 +23,7 @@ infoNN/
 
 ### 环境要求
 
-- Python 3.7+
+- Python 3.13(开发下版本)
 - Jupyter Notebook
 - 相关机器学习库 (requirements.txt 中列出)
 
